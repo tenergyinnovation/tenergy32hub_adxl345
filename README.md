@@ -1,2 +1,2 @@
-# tenergy32hub_adxl345
-tenergy32hub interface with ADX345
+# smartbuilding360hub
+Example code Smart Building 360 Hub IoT board

@@ -1,0 +1,304 @@
+/***********************************************************************
+ * Project      :     smartbuilding360hub ADXL345 Accelerometer Sensor
+ * Description  :     Read 3-axis acceleration data from ADXL345 sensor via I2C
+ *                    Display data on Serial Monitor and OLED display
+ *                    Calculate vibration magnitude and detect movement
+ * Hardware     :     tenergy32hub + ADXL345 accelerometer
+ * Author       :     Tenergy Innovation Co., Ltd.
+ * Date         :     29/07/2025
+ * Revision     :     2.0
+ * Rev1.0       :     Original vibration sensor using ADC
+ * Rev2.0       :     Updated to use ADXL345 I2C accelerometer
+ * website      :     http://www.tenergyinnovation.co.th
+ * Email        :     uten.boonliam@tenergyinnovation.co.th
+ * TEL          :     +66 89-140-7205
+ ***********************************************************************/
+#include <Arduino.h>
+#include <tenergy32hub.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
+#include <Wire.h>
+
+/**************************************/
+/*          Firmware Version          */
+/**************************************/
+String version = "2.0"; // ADXL345 accelerometer version
+
+/**************************************/
+/*       ADXL345 Configuration        */
+/**************************************/
+#define ADXL345_ADDRESS 0x53        // ADXL345 I2C address (ALT ADDRESS pin to GND)
+#define ADXL345_ALT_ADDRESS 0x1D    // Alternative address (ALT ADDRESS pin to VCC)
+
+// ADXL345 Register addresses
+#define ADXL345_REG_DEVID 0x00      // Device ID register
+#define ADXL345_REG_POWER_CTL 0x2D  // Power control register  
+#define ADXL345_REG_DATA_FORMAT 0x31 // Data format register
+#define ADXL345_REG_DATAX0 0x32     // X-axis data register (LSB)
+#define ADXL345_REG_DATAX1 0x33     // X-axis data register (MSB)
+#define ADXL345_REG_DATAY0 0x34     // Y-axis data register (LSB)
+#define ADXL345_REG_DATAY1 0x35     // Y-axis data register (MSB)
+#define ADXL345_REG_DATAZ0 0x36     // Z-axis data register (LSB)
+#define ADXL345_REG_DATAZ1 0x37     // Z-axis data register (MSB)
+
+// ADXL345 Configuration values
+#define ADXL345_POWER_MEASURE 0x08  // Enable measurement mode
+#define ADXL345_RANGE_2G 0x00       // ±2g range (256 LSB/g)
+#define ADXL345_RANGE_4G 0x01       // ±4g range (128 LSB/g)  
+#define ADXL345_RANGE_8G 0x02       // ±8g range (64 LSB/g)
+#define ADXL345_RANGE_16G 0x03      // ±16g range (32 LSB/g)
+
+/**************************************/
+/*          Sensor Variables          */
+/**************************************/
+bool adxl345_available = false;    // ADXL345 sensor availability flag
+float scale_factor = 256.0;        // Scale factor for ±2g range (LSB/g)
+float vibration_threshold = 1.5;   // Vibration detection threshold (g)
+
+/**************************************/
+/*          Header project            */
+/**************************************/
+void header_print(void)
+{
+    Serial.printf("\r\n***********************************************************************\r\n");
+    Serial.printf("* Project      :     smartbuilding360hub ADXL345 Accelerometer Sensor\r\n");
+    Serial.printf("* Description  :     Read 3-axis acceleration from ADXL345 via I2C\r\n");
+    Serial.printf("* Hardware     :     tenergy32hub + ADXL345\r\n");
+    Serial.printf("* Author       :     Tenergy Innovation Co., Ltd.\r\n");
+    Serial.printf("* Date         :     29/07/2025\r\n");
+    Serial.printf("* Revision     :     %s\r\n", version.c_str());
+    Serial.printf("* Rev2.0       :     ADXL345 I2C accelerometer implementation\r\n");
+    Serial.printf("* website      :     http://www.tenergyinnovation.co.th\r\n");
+    Serial.printf("* Email        :     uten.boonliam@tenergyinnovation.co.th\r\n");
+    Serial.printf("* TEL          :     +66 89-140-7205\r\n");
+    Serial.printf("***********************************************************************/\r\n");
+}
+
+/**************************************/
+/*        define object variable      */
+/**************************************/
+Tenergy32Hub mcu; // สร้างอ็อบเจกต์ mcu สำหรับควบคุมบอร์ด tenergy32hub
+
+/**************************************/
+/*       Constant define value        */
+/**************************************/
+#define WDT_TIMEOUT 10  // กำหนดค่า timeout สำหรับ Watchdog Timer เป็น 10 วินาที
+
+/**************************************/
+/*          ADXL345 Functions         */
+/**************************************/
+
+/***********************************************************************
+ * FUNCTION:    writeADXL345Register
+ * DESCRIPTION: Write data to ADXL345 register via I2C
+ * PARAMETERS:  reg - register address
+ *              value - data to write
+ * RETURNED:    true if successful, false otherwise
+ ***********************************************************************/
+bool writeADXL345Register(uint8_t reg, uint8_t value) 
+{
+    Wire.beginTransmission(ADXL345_ADDRESS);
+    Wire.write(reg);
+    Wire.write(value);
+    return (Wire.endTransmission() == 0);
+}
+
+/***********************************************************************
+ * FUNCTION:    readADXL345Register
+ * DESCRIPTION: Read data from ADXL345 register via I2C
+ * PARAMETERS:  reg - register address
+ * RETURNED:    register value, 0xFF on error
+ ***********************************************************************/
+uint8_t readADXL345Register(uint8_t reg) 
+{
+    Wire.beginTransmission(ADXL345_ADDRESS);
+    Wire.write(reg);
+    if (Wire.endTransmission() != 0) return 0xFF;
+    
+    Wire.requestFrom(ADXL345_ADDRESS, 1);
+    if (Wire.available()) {
+        return Wire.read();
+    }
+    return 0xFF;
+}
+
+/***********************************************************************
+ * FUNCTION:    initADXL345
+ * DESCRIPTION: Initialize ADXL345 accelerometer sensor
+ * PARAMETERS:  none
+ * RETURNED:    true if initialization successful, false otherwise
+ ***********************************************************************/
+bool initADXL345() 
+{
+    Serial.println("Initializing ADXL345...");
+    
+    // ตรวจสอบ Device ID (should be 0xE5)
+    uint8_t deviceId = readADXL345Register(ADXL345_REG_DEVID);
+    Serial.printf("ADXL345 Device ID: 0x%02X\r\n", deviceId);
+    
+    if (deviceId != 0xE5) {
+        Serial.println("ADXL345 not found! Check connections.");
+        return false;
+    }
+    
+    // กำหนดค่า Data Format Register (±2g range, 10-bit resolution)
+    if (!writeADXL345Register(ADXL345_REG_DATA_FORMAT, ADXL345_RANGE_2G)) {
+        Serial.println("Failed to configure ADXL345 data format");
+        return false;
+    }
+    
+    // เปิดใช้งาน measurement mode
+    if (!writeADXL345Register(ADXL345_REG_POWER_CTL, ADXL345_POWER_MEASURE)) {
+        Serial.println("Failed to enable ADXL345 measurement mode");
+        return false;
+    }
+    
+    Serial.println("ADXL345 initialized successfully!");
+    return true;
+}
+
+/***********************************************************************
+ * FUNCTION:    readADXL345Data
+ * DESCRIPTION: Read acceleration data from ADXL345
+ * PARAMETERS:  x, y, z - pointers to store acceleration values (in g)
+ * RETURNED:    true if read successful, false otherwise
+ ***********************************************************************/
+bool readADXL345Data(float* x, float* y, float* z) 
+{
+    // อ่านข้อมูล 6 bytes จาก register 0x32-0x37
+    Wire.beginTransmission(ADXL345_ADDRESS);
+    Wire.write(ADXL345_REG_DATAX0);
+    if (Wire.endTransmission() != 0) return false;
+    
+    Wire.requestFrom(ADXL345_ADDRESS, 6);
+    
+    if (Wire.available() < 6) return false;
+    
+    // อ่านข้อมูล X, Y, Z (16-bit signed values)
+    int16_t rawX = Wire.read() | (Wire.read() << 8);
+    int16_t rawY = Wire.read() | (Wire.read() << 8);
+    int16_t rawZ = Wire.read() | (Wire.read() << 8);
+    
+    // แปลงเป็นค่า g (gravity)
+    *x = rawX / scale_factor;
+    *y = rawY / scale_factor;
+    *z = rawZ / scale_factor;
+    
+    return true;
+}
+
+/***********************************************************************
+ * FUNCTION:    calculateMagnitude
+ * DESCRIPTION: Calculate acceleration magnitude vector
+ * PARAMETERS:  x, y, z - acceleration values
+ * RETURNED:    magnitude value
+ ***********************************************************************/
+float calculateMagnitude(float x, float y, float z) 
+{
+    return sqrt(x*x + y*y + z*z);
+}
+
+
+/***********************************************************************
+ * FUNCTION:    setup
+ * DESCRIPTION: Initialize system and ADXL345 sensor
+ * PARAMETERS:  nothing
+ * RETURNED:    nothing
+ ***********************************************************************/
+void setup()
+{
+    Serial.begin(115200);  // เริ่มต้น Serial ที่ baudrate 115200
+    header_print();        // แสดงข้อมูล Header ของโปรเจกต์
+
+    mcu.begin();           // เริ่มต้นการทำงานของบอร์ด tenergy32hub
+    mcu.displayOLEDInfo(); // แสดงข้อมูลบนหน้าจอ OLED
+    vTaskDelay(1000);      // หน่วงเวลา 1 วินาที
+
+    // เริ่มต้น I2C สำหรับ ADXL345 (ใช้ pins ที่กำหนดใน tenergy32hub)
+    // I2C ได้ถูกเริ่มต้นแล้วใน mcu.begin()
+    
+    // เริ่มต้น ADXL345 accelerometer
+    adxl345_available = initADXL345();
+    if (adxl345_available) {
+        Serial.println("ADXL345 initialized successfully.");
+        mcu.displayOLEDLines("ADXL345 Ready", "Accelerometer OK");
+        mcu.beep(2, 100); // บี๊บ 2 ครั้งแสดงว่าสำเร็จ
+    } else {
+        Serial.println("Failed to initialize ADXL345.");
+        mcu.displayOLEDLines("ADXL345 Error", "Check connection");
+        mcu.beep(3, 200); // บี๊บ 3 ครั้งยาวแสดงว่าผิดพลาด
+    }
+    
+    vTaskDelay(2000); // แสดงผลบน OLED 2 วินาที
+
+    // ตั้งค่าและเปิดใช้งาน Watchdog Timer (WDT) ที่ 10 วินาที
+    esp_task_wdt_init(WDT_TIMEOUT, true); // true = รีเซ็ต CPU เมื่อ WDT timeout
+    esp_task_wdt_add(NULL);               // เพิ่ม task ปัจจุบันเข้า WDT monitoring
+    
+    Serial.println("System ready - starting acceleration monitoring...");
+}
+
+/***********************************************************************
+ * FUNCTION:    loop
+ * DESCRIPTION: Main loop - read ADXL345 data and process
+ * PARAMETERS:  nothing
+ * RETURNED:    nothing
+ ***********************************************************************/
+void loop()
+{
+    if (!adxl345_available) {
+        // ถ้า ADXL345 ไม่พร้อมใช้งาน แสดงข้อความข้อผิดพลาด
+        mcu.displayOLEDLines("ADXL345 Error", "Sensor offline");
+        Serial.println("ADXL345 not available");
+        delay(1000);
+        esp_task_wdt_reset();
+        return;
+    }
+
+    // อ่านข้อมูล acceleration จาก ADXL345
+    float x, y, z;
+    if (readADXL345Data(&x, &y, &z)) {
+        // คำนวณ magnitude vector (ความแรงรวมของการสั่นสะเทือน)
+        float magnitude = calculateMagnitude(x, y, z);
+        
+        // แสดงข้อมูลทาง Serial Monitor
+        Serial.printf("X: %6.3fg  Y: %6.3fg  Z: %6.3fg  |Mag: %6.3fg|\r\n", 
+                     x, y, z, magnitude);
+        
+        // สร้างข้อความสำหรับแสดงบน OLED
+        char line1[22], line2[22], line3[22], line4[22];
+        
+        // ตรวจสอบการสั่นสะเทือน
+        if (magnitude > vibration_threshold) {
+            // ตรวจพบการสั่นสะเทือน
+            snprintf(line1, sizeof(line1), "** VIBRATION **");
+            snprintf(line2, sizeof(line2), "Mag: %.2fg", magnitude);
+            snprintf(line3, sizeof(line3), "X:%.2f Y:%.2f", x, y);
+            snprintf(line4, sizeof(line4), "Z:%.2f", z);
+            
+            mcu.displayOLEDLines(line1, line2, line3, line4);
+            mcu.setRedLED(true);   // เปิด LED แดง
+            mcu.beep(1, 50);       // เสียงแจ้งเตือนสั้น
+            
+            Serial.println("*** VIBRATION DETECTED! ***");
+        } else {
+            // สภาวะปกติ
+            snprintf(line1, sizeof(line1), "ADXL345 Monitor");
+            snprintf(line2, sizeof(line2), "Mag: %.3fg", magnitude);
+            snprintf(line3, sizeof(line3), "X:%.2f Y:%.2f", x, y);
+            snprintf(line4, sizeof(line4), "Z:%.2f T:%.1f", z, vibration_threshold);
+            
+            mcu.displayOLEDLines(line1, line2, line3, line4);
+            mcu.setRedLED(false);  // ปิด LED แดง
+        }
+        
+    } else {
+        // อ่านข้อมูลไม่สำเร็จ
+        Serial.println("Failed to read ADXL345 data");
+        mcu.displayOLEDLines("Read Error", "ADXL345 fail");
+        mcu.setRedLED(true);
+    }
+
+    delay(10);            // หน่วงเวลา 250ms (4 readings per second)
+    esp_task_wdt_reset();  // รีเซ็ต watchdog timer
+}
